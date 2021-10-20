@@ -1,116 +1,93 @@
-#-*- coding:UTF-8 -*-
-
-import numpy as np, torch, os, json, wfdb, sys, bisect
+import os, wfdb, numpy as np, torch, itertools, json, sys
 from model import UNet
-from utils import qrs_detect
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-def find_closest_index(a, x):
-    i = bisect.bisect_left(a, x)
-    if i >= len(a):
-        i = len(a) - 1
-    elif i and a[i] - x > x - a[i - 1]:
-        i = i - 1
-    return i
 
 
-def challenge_entry(sample_path):
-    # 利用sig数据，返回列表，形式如[[s0,e0],[s1,e1],..,[sn,en]]
-    sig, _, fs = load_data(sample_path)
-    r_peaks = qrs_detect(sig[:,1], fs=200)
-    # point_ans = []
-    ans_01 = data_to_label(sig)
-    # 判断三大类
-    if sum(ans_01)/len(ans_01)<0.1:
-        cls = 'Normal'
-        r_ans = []
-    elif sum(ans_01)/len(ans_01)>0.9:
-        cls = 'AFf'
-        # point_ans.append([0,len(ans_01)])
-        r_ans = [[0,len(r_peaks)]]
-    else:
-        cls = 'AFp'
-        r_ans = []
-        # 如果为阵发性房颤，判断点位
-        lst = []
-        for i in range(len(ans_01)):
-            cmp = ans_01[i-1] if i>0 else 0
-            if ans_01[i]!=cmp:
-                lst.append(i)
-        s = lst[0::2]
-        e = lst[1::2]
-        if len(lst)%2 == 1:
-            e.append(len(ans_01))
-        s_ = s[:]
-        e_ = e[:]
-        if len(s) == 1:
-            # point_ans.append([s[0], e[0]])
-            r_ans.append([find_closest_index(r_peaks,s_[0]),find_closest_index(r_peaks,e_[0])])
+class load_model:
+
+    def __init__(self):
+        # 初始化函数，加载模型
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        self.net = UNet().to(self.device)
+        self.checkpoint = torch.load('model_train1018_{}_withP_{}.pt'.format('I', 0))
+        self.net.load_state_dict(self.checkpoint['model'])
+        self.net.eval()
+
+    def predict(self, data, length):
+        # 输入(n,2,2000)的测试数据，返回(length,)的标签
+        data = torch.from_numpy(data)
+        data = data.float().to(self.device)
+        out = np.argmax(self.net(data).cpu().detach().numpy(), axis=1)
+        dim = out.shape[0]
+        if dim == 1:
+            ans = out[0, :length]
+        elif dim == 2:
+            ans = np.concatenate((out[0, :1900], out[1, 1900 - length:]))
         else:
-            for j in range(len(s) - 1):
-                if s[j + 1] - e[j] < 1000:
-                    s_.remove(s[j + 1])
-                    e_.remove(e[j])
-        for k in range(len(s_)):
-            r_ans.append([find_closest_index(r_peaks,s_[k]),find_closest_index(r_peaks,e_[k])])
+            ans = out[0, :1900]
+            for i in range(1, dim - 1):
+                ans = np.concatenate((ans, out[i, 100:-100]))
+            ans = np.concatenate((ans, out[-1, dim * 1800 - length - 1700:]))
+        return ans
 
-    pred_dcit = {'predict_endpoints': r_ans}
+
+def data_val(SAMPLE_PATH):
+    # 输入文件路径，返回(n,2,2000)的测试数据
+    rec = wfdb.rdrecord(SAMPLE_PATH)
+    sig = rec.p_signal.T
+    length = sig.shape[1]
+    if length < 2000:
+        data = np.zeros((1, 2, 2000))
+        data[0, :, :length] = sig
+    else:
+        dim0 = (length - 200) // 1800 if (length - 200) % 1800 == 0 else (length - 200) // 1800 + 1
+        data = np.zeros((dim0, 2, 2000))
+        for i in range((length - 200) // 1800):
+            data[i, :, :] = sig[:, 1800 * i:1800 * i + 2000]
+        if (length - 200) % 1800:
+            data[-1, :, :] = sig[:, -2000:]
+    return data, length
+
+
+def get_result(ANS_DATA):
+    # 输入(length,)的标签，返回起止点
+    # 将预测标签转换为R波所在位置列表r_pos和其对应的R波种类列表note
+    t = [(k, sum(1 for _ in vs)) for k, vs in itertools.groupby(ANS_DATA)]
+    note = []
+    r_pos = []
+    lens = 0
+    for item in t:
+        lens += item[1]
+        if item[0] == 1 and item[1] >= 40:
+            note.append(1)
+            r_pos.append(lens - int(item[1] * 0.7))
+        elif item[0] == 2 and item[1] >= 40:
+            note.append(2)
+            r_pos.append(lens - int(item[1] * 0.7))
+    # 根据note判断数据类型，并且根据r_pos返回相应结论
+    se = [(k, sum(1 for _ in vs)) for k, vs in itertools.groupby(note)]
+    r = 0
+    st_ed = []
+    for elem in se:
+        r += elem[1]
+        if elem[0] == 2:
+            st_ed.append([r_pos[r - elem[1]], r_pos[r - 1]])
+    pred_dcit = {'predict_endpoints': st_ed}
     return pred_dcit
+
 
 def save_dict(filename, dic):
     '''save dict into json file'''
-    with open(filename,'w') as json_file:
+    with open(filename, 'w') as json_file:
         json.dump(dic, json_file, ensure_ascii=False)
 
-def load_data(sample_path):
-    sig, fields = wfdb.rdsamp(sample_path)
-    length = len(sig)
-    fs = fields['fs']
-    return sig, length, fs
-
-def data_to_label(data):
-    # data:(ori_length,2)->x:(m,2,2000)->model_predict->y:(m,1,2000)->label:(ori_length,)
-    length = data.shape[0]
-    if length<2000:
-        d = np.zeros((2000,2))
-        d[-length:,:] = data
-        data = d
-        length = 2000
-    data_num = length // 2000 if length % 2000 == 0 else length // 2000 + 1
-    x = np.zeros((data_num, 2, 2000))
-    for i in range(length // 2000):
-        x[i, :, :] = data[2000 * i:2000 * i + 2000, :].T
-    if length % 2000:
-        x[-1, :, :] = data[-2000:,:].T
-    y = np.zeros((data_num, 1, 2000))
-    for k in range(5):
-        model_name = 'model_train_I{}.pt'.format(k)
-        label = model_pre(x,model_name)
-        y+=label
-    y = np.round(y/5).reshape(data_num,2000)
-    label = np.zeros((length))
-    for j in range(length // 2000):
-        label[2000*j:2000 * j + 2000] = y[j]
-    if length % 2000:
-        label[-2000:]=y[-1]
-    return label
-
-def model_pre(X,model_name):
-    net = UNet().to(device)
-    checkpoint = torch.load(model_name)
-    net.load_state_dict(checkpoint['model'])
-    net.eval()
-    x = torch.from_numpy(X)
-    x = x.float().to(device)
-    out = net(x).cpu().detach().numpy()
-    return out
 
 if __name__ == '__main__':
     DATA_PATH = sys.argv[1]
     RESULT_PATH = sys.argv[2]
     # DATA_PATH = 'training_II'
     # RESULT_PATH = 'result'
+
+    m = load_model()
 
     if not os.path.exists(RESULT_PATH):
         os.makedirs(RESULT_PATH)
@@ -119,5 +96,7 @@ if __name__ == '__main__':
     for i, sample in enumerate(test_set):
         print(sample)
         sample_path = os.path.join(DATA_PATH, sample)
-        pred_dict = challenge_entry(sample_path)
-        save_dict(os.path.join(RESULT_PATH, sample + '.json'), pred_dict)
+        train_data, data_length = data_val(sample_path)
+        ans_data = m.predict(train_data, data_length)
+        ans = get_result(ans_data)
+        save_dict(os.path.join(RESULT_PATH, sample + '.json'), ans)
