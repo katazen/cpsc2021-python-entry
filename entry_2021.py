@@ -7,16 +7,31 @@ class load_model:
     def __init__(self):
         # 初始化函数，加载模型
         self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-        self.net = UNet().to(self.device)
-        self.checkpoint = torch.load('model_train1018_{}_withP_{}.pt'.format('I', 0))
-        self.net.load_state_dict(self.checkpoint['model'])
-        self.net.eval()
+        self.net0 = UNet().to(self.device)
+        self.checkpoint0 = torch.load('model_train1018_{}_withP_{}.pt'.format('I', 0))
+        self.net0.load_state_dict(self.checkpoint0['model'])
+        self.net0.eval()
+        self.net1 = UNet().to(self.device)
+        self.checkpoint1 = torch.load('model_train1018_{}_withP_{}.pt'.format('II', 0))
+        self.net1.load_state_dict(self.checkpoint1['model'])
+        self.net1.eval()
+        self.net2 = UNet().to(self.device)
+        self.checkpoint2 = torch.load('model_train1018_{}_withP_{}.pt'.format('II', 1))
+        self.net2.load_state_dict(self.checkpoint2['model'])
+        self.net2.eval()
 
     def predict(self, data, length):
         # 输入(n,2,2000)的测试数据，返回(length,)的标签
         data = torch.from_numpy(data)
         data = data.float().to(self.device)
-        out = np.argmax(self.net(data).cpu().detach().numpy(), axis=1)
+        out = (self.net0(data)+self.net1(data)+self.net2(data))/3
+        out = np.argmax(out.cpu().detach().numpy(),axis=1)
+
+        # out0 = self.net0(data).cpu().detach().numpy()
+        # out1 = self.net1(data).cpu().detach().numpy()
+        # out2 = self.net2(data).cpu().detach().numpy()
+        # out = (out0+out1+out2)/3
+        # out = np.argmax(out, axis=1)
         dim = out.shape[0]
         if dim == 1:
             ans = out[0, :length]
@@ -71,6 +86,7 @@ def get_result(ANS_DATA):
         r += elem[1]
         if elem[0] == 2:
             st_ed.append([r_pos[r - elem[1]], r_pos[r - 1]])
+    # st_ed = st_ed_check(st_ed)
     pred_dcit = {'predict_endpoints': st_ed}
     return pred_dcit
 
@@ -79,6 +95,11 @@ def save_dict(filename, dic):
     '''save dict into json file'''
     with open(filename, 'w') as json_file:
         json.dump(dic, json_file, ensure_ascii=False)
+
+
+def st_ed_check(ST_ED):
+    # 对最终结论的列表添加筛选规则
+    pass
 
 
 if __name__ == '__main__':
